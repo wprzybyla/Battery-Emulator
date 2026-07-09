@@ -4,10 +4,12 @@
 #include "../datalayer/datalayer.h"
 #include "../devboard/utils/events.h"
 
-/* TODO: 
-- The HEV battery seems to turn off after 1 minute of use. When this happens SOC% stops updating.
-- We need to figure out how to keep the BMS alive. Most likely we need to send a specific CAN message
-*/
+/* FSM precharge/contactor sequence - Santa Fe layout (the only one verified on the Kia Ceed PHEV 96S,
+ * logceed5). IDLE -> KL15 (0x523 IGN/HCU) -> PRECHARGE (0x200 D4=0x80, 0x2A1 ramp 0x30->0x45) ->
+ * ACTIVE (0x2F0 contactor bits). Previously the driver only sent static frames (0x09, 0x0B) with no
+ * sequence, and the BMU shut down after ~1 min. The 0x2A1 D6 value is a logical value for the BMU
+ * FSM, not a real voltage measurement.
+ */
 
 static uint8_t CalculateCRC8(const CAN_frame& frame) {
   uint8_t crc = 0x00;
@@ -274,9 +276,22 @@ void KiaHyundaiHybridBattery::transmit_can(unsigned long currentMillis) {
   if (currentMillis - previousMillis10 >= INTERVAL_10_MS) {
     previousMillis10 = currentMillis;
 
-    KIA_200.data.u8[6] = (counter_200 & 0x0F) << 1;
+    // --- FSM transitions ---
+    state_timer_10ms++;
 
-    // CRC8 – Santa Fe style (byte 7)
+    if (bmu_state == BMU_KL15 && state_timer_10ms >= T_KL15_10MS) {
+      bmu_state = BMU_PRECHARGE;
+      state_timer_10ms = 0;
+    } else if (bmu_state == BMU_PRECHARGE && state_timer_10ms >= T_PRECHARGE_10MS) {
+      bmu_state = BMU_ACTIVE;
+      state_timer_10ms = 0;
+    }
+
+    // --- 0x200: HV Request (Santa Fe layout, logceed5) ---
+    // D4 = precharge bit, D5 = 0x30 (constant), D6 = alive 4b, D7 = CRC8
+    KIA_200.data.u8[4] = (bmu_state == BMU_PRECHARGE) ? 0x80 : 0x00;
+    KIA_200.data.u8[5] = 0x30;
+    KIA_200.data.u8[6] = (counter_200 & 0x0F) << 1;
     KIA_200.data.u8[7] = 0x00;
     KIA_200.data.u8[7] = CalculateCRC8(KIA_200);
 
@@ -287,17 +302,58 @@ void KiaHyundaiHybridBattery::transmit_can(unsigned long currentMillis) {
       counter_200 = 0;
     }
 
-    KIA_2A1.data.u8[0] = 0x09;
+    // --- 0x2A1: DC Link Voltage (Santa Fe layout, logceed5) ---
+    // D6 = logical voltage ramp for the BMU FSM (PRECHARGE: 0x30->0x45, ACTIVE: 0xFF), D7 = 0x02
+    KIA_2A1.data.u8[0] = 0x00;
+    if (bmu_state == BMU_PRECHARGE) {
+      // Monotonic ramp 0x30->0x45 (21 steps) over the ~1.5 s precharge window
+      uint8_t step = (uint8_t)((uint32_t)state_timer_10ms * 21 / T_PRECHARGE_10MS);
+      if (step > 21) {
+        step = 21;
+      }
+      KIA_2A1.data.u8[6] = 0x30 + step;
+    } else if (bmu_state == BMU_ACTIVE) {
+      KIA_2A1.data.u8[6] = 0xFF;
+    } else {
+      KIA_2A1.data.u8[6] = 0x00;
+    }
+    KIA_2A1.data.u8[7] = 0x02;
     transmit_can_frame(&KIA_2A1);
 
-    KIA_2F0.data.u8[0] = 0x0B;
+    // --- 0x2F0: HV Enable (Santa Fe layout, logceed5) ---
+    // D0 b0 = contactor1, D6 b6 = contactor2, D6 b0-1 = alive, D7 = CRC8
+    if (bmu_state == BMU_ACTIVE) {
+      KIA_2F0.data.u8[0] = 0x01;
+      KIA_2F0.data.u8[6] = (counter_2F0 & 0x03) | 0x40;
+    } else {
+      KIA_2F0.data.u8[0] = 0x00;
+      KIA_2F0.data.u8[6] = (counter_2F0 & 0x03);
+    }
+    KIA_2F0.data.u8[7] = 0x00;
+    KIA_2F0.data.u8[7] = CalculateCRC8(KIA_2F0);
     transmit_can_frame(&KIA_2F0);
+
+    counter_2F0++;
+    if (counter_2F0 > 0x03) {
+      counter_2F0 = 0;
+    }
   }
 
   // Send 100ms CAN Message
   if (currentMillis - previousMillis100 >= INTERVAL_100_MS) {
     previousMillis100 = currentMillis;
 
+    // --- 0x523: IGN/HCU Ready (Santa Fe layout, logceed5) ---
+    // D0 = 0x60 (IGN ON), D2 = 0x60 (HCU ready), D7 = alive 2b
+    if (bmu_state >= BMU_KL15) {
+      KIA_523.data.u8[0] = 0x60;
+      KIA_523.data.u8[2] = 0x60;
+      KIA_523.data.u8[7] = (counter_523 & 0x03);
+      counter_523++;
+      if (counter_523 > 0x03) {
+        counter_523 = 0;
+      }
+    }
     transmit_can_frame(&KIA_523);
 
     if (UserRequestDTCreset) {

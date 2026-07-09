@@ -28,6 +28,22 @@ class KiaHyundaiHybridBattery : public CanBattery {
   unsigned long previousMillis1000 = 0;  // will store last time a 1000ms CAN Message was send
 
   uint8_t counter_200 = 0;
+  uint8_t counter_2F0 = 0;
+  uint8_t counter_523 = 0;
+
+  // FSM: IDLE(0) -> KL15(1) -> PRECHARGE(2) -> ACTIVE(3)
+  // Santa Fe layout - the only sequence verified on the Kia Ceed PHEV 96S (logceed5). The BMU will not
+  // close its contactors until it has seen ignition (0x523), a precharge request (0x200 D4) with the
+  // 0x2A1 voltage ramp, and finally the HV-enable (0x2F0 contactor bits).
+  static const uint8_t BMU_IDLE = 0;
+  static const uint8_t BMU_KL15 = 1;
+  static const uint8_t BMU_PRECHARGE = 2;
+  static const uint8_t BMU_ACTIVE = 3;
+  uint8_t bmu_state = BMU_KL15;  // Auto-start straight into KL15
+  uint16_t state_timer_10ms = 0;
+  static const uint16_t T_KL15_10MS = 30;        // 300 ms
+  static const uint16_t T_PRECHARGE_10MS = 150;  // 1.5 s
+
   uint16_t SOC = 0;
   uint16_t SOC_display = 0;
   bool interlock_missing = false;
@@ -62,24 +78,31 @@ class KiaHyundaiHybridBattery : public CanBattery {
                        .ext_ID = false,
                        .DLC = 8,
                        .ID = 0x200,
+                       // D4 = precharge bit (PRECHARGE only), D5 = 0x30 constant, D6 = 4-bit alive counter,
+                       // D7 = CRC8. All set in transmit_can().
                        .data = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
 
   CAN_frame KIA_2A1 = {.FD = false,
                        .ext_ID = false,
                        .DLC = 8,
                        .ID = 0x2A1,
+                       // D6 = logical DC-link voltage for the BMU FSM (PRECHARGE ramp 0x30->0x45,
+                       // ACTIVE 0xFF), D7 = 0x02. NOT a real measurement. Set in transmit_can().
                        .data = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
 
   CAN_frame KIA_2F0 = {.FD = false,
                        .ext_ID = false,
                        .DLC = 8,
                        .ID = 0x2F0,
+                       // D0 bit0 = contactor1, D6 bit6 = contactor2, D6 bits0-1 = 2-bit alive counter,
+                       // D7 = CRC8. Contactors are commanded only in the ACTIVE state.
                        .data = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
 
   CAN_frame KIA_523 = {.FD = false,
                        .ext_ID = false,
                        .DLC = 8,
                        .ID = 0x523,
+                       // D0 = 0x60 (ignition on), D2 = 0x60 (HCU ready), D7 = 2-bit alive counter (no CRC).
                        .data = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
 };
 
