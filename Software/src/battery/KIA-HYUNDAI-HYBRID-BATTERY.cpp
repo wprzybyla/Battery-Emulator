@@ -88,7 +88,7 @@ void KiaHyundaiHybridBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
     case 0x5AE:
       datalayer.battery.status.CAN_battery_still_alive = CAN_STILL_ALIVE;
 
-      interlock_missing = (bool)(rx_frame.data.u8[1] & 0x02) >> 1;
+      interlock_missing = (rx_frame.data.u8[1] & 0x02) != 0;
       break;
     case 0x5AF:
       break;
@@ -306,8 +306,10 @@ void KiaHyundaiHybridBattery::transmit_can(unsigned long currentMillis) {
     // D6 = logical voltage ramp for the BMU FSM (PRECHARGE: 0x30->0x45, ACTIVE: 0xFF), D7 = 0x02
     KIA_2A1.data.u8[0] = 0x00;
     if (bmu_state == BMU_PRECHARGE) {
-      // Monotonic ramp 0x30->0x45 (21 steps) over the ~1.5 s precharge window
-      uint8_t step = (uint8_t)((uint32_t)state_timer_10ms * 21 / T_PRECHARGE_10MS);
+      // Monotonic ramp 0x30->0x45 (21 steps) over the precharge window. state_timer_10ms runs 0..
+      // (T_PRECHARGE_10MS - 1) while in PRECHARGE (it transitions to ACTIVE once it reaches
+      // T_PRECHARGE_10MS), so divide by (T_PRECHARGE_10MS - 1) to reach 0x45 on the final tick.
+      uint8_t step = (uint8_t)((uint32_t)state_timer_10ms * 21 / (T_PRECHARGE_10MS - 1));
       if (step > 21) {
         step = 21;
       }
